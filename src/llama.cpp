@@ -2714,6 +2714,7 @@ struct llama_model {
 
 // Object used to allow caching of GGML graph between tokens where possible.
 struct ggml_cached_graph {
+    bool is_active = false;
     ggml_cgraph * gf;
     size_t n;
     ggml_backend_t backend_res;
@@ -14550,7 +14551,11 @@ static int llama_decode_internal(
 
         gf = llama_build_graph(lctx, u_batch, false);
 
-        // disable future graph caching in presense of env var,
+        // Set whether GGML graph caching is in use within GGML module, based on
+        // whether caching was activated here during the previous token
+        ggml_set_cached_graph(lctx.sched,lctx.cached_graph.is_active);
+
+        // Disable future graph caching in presence of env var,
         // if there are multiple devices, or if batch size is greater than 1
         // TO DO enable graph caching for these cases
         bool disable_cached_ggml_graph = (getenv("GGML_DISABLE_GRAPH_CACHING") != nullptr)
@@ -14562,7 +14567,8 @@ static int llama_decode_internal(
             }
         }
 
-        if(!disable_cached_ggml_graph) ggml_set_cached_graph(lctx.sched,true);
+        // Set whether graph caching should be used for future tokens
+        lctx.cached_graph.is_active=!disable_cached_ggml_graph;
 
         // the output is always the last tensor in the graph
         res  = gf->nodes[gf->n_nodes - 1];
