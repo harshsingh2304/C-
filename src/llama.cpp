@@ -14556,10 +14556,12 @@ static int llama_decode_internal(
         ggml_set_cached_graph(lctx.sched,lctx.cached_graph.is_active);
 
         // Disable future graph caching in presence of env var,
-        // if there are multiple devices, or if batch size is greater than 1
+        // if there are multiple devices, if batch size is greater than 1,
+        // or if nsplits is not 2.
         // TO DO enable graph caching for these cases
         bool disable_cached_ggml_graph = (getenv("GGML_DISABLE_GRAPH_CACHING") != nullptr)
-            || (llama_get_device_count(model) > 1);
+            || (llama_get_device_count(model) > 1)
+            || (ggml_backend_sched_get_n_splits(lctx.sched) != 2);
         for (int i = 0 ; i < gf->n_nodes; i++) {
             if (gf->nodes[i]->op == GGML_OP_ADD && gf->nodes[i]->src[1] && gf->nodes[i]->src[1]->ne[1] > 1) {
                 disable_cached_ggml_graph = true;
