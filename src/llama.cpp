@@ -14613,7 +14613,6 @@ static int llama_decode_internal(
             const struct llama_hparams & hparams = model.hparams;
             const int64_t  n_layer = hparams.n_layer;
             const int64_t kv_head = kv_self.head;
-            std::vector<void *> kv_cache_ptrs;
             std::vector<void *> k_cache_ptrs;
             std::vector<void *> v_cache_ptrs;
             for (int il = 0; il < n_layer; ++il) {
@@ -14621,7 +14620,6 @@ static int llama_decode_internal(
                 const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa();
                 ggml_tensor * tmp_tensor =  kv_self.k_l[il];
                 size_t tmp_offset = (ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa))*kv_head;
-                kv_cache_ptrs.push_back(static_cast<char*>(tmp_tensor->data) + tmp_offset);
                 k_cache_ptrs.push_back(static_cast<char*>(tmp_tensor->data) + tmp_offset);
                 tmp_tensor = kv_self.v_l[il];
                 if (cparams.flash_attn) {
@@ -14629,7 +14627,6 @@ static int llama_decode_internal(
                 } else {
                     tmp_offset = (kv_head)*ggml_element_size(kv_self.v_l[il]);
                 }
-                kv_cache_ptrs.push_back(static_cast<char*>(tmp_tensor->data) + tmp_offset);
                 v_cache_ptrs.push_back(static_cast<char*>(tmp_tensor->data) + tmp_offset);
             }
 
