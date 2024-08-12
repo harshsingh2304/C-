@@ -2564,11 +2564,17 @@ bool ggml_amx_init() {
 }
 
 bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
+  GGML_UNUSED(dst);
   fprintf(stderr, "GGML is not compiled with AMX support!\n");
   return false;
 }
 
 void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, int wsize) {
+  GGML_UNUSED(dst);
+  GGML_UNUSED(nth);
+  GGML_UNUSED(ith);
+  GGML_UNUSED(wdata);
+  GGML_UNUSED(wsize);
   fprintf(stderr, "GGML is not compiled with AMX support!\n");
 }
 
