@@ -2490,7 +2490,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
       for (int m = begin; m < end; ++m) {
         from_float<vec_dot_type>(A_data + m * K, (char *)wdata + m * row_size_A, K);
       }
-    });    
+    });
   });
   #pragma omp barrier
 
