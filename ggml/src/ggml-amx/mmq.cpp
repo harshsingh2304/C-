@@ -2363,8 +2363,18 @@ bool ggml_amx_init() {
 }
 
 bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
-  // load tile config
-  ggml_tile_config_init();
+
+  static thread_local bool is_first_time = true;
+  if (is_first_time) {
+    #pragma omp single
+    {
+      ggml_amx_init();
+    }
+
+    // load tile config
+    ggml_tile_config_init();
+  }
+  is_first_time = false;
 
   const struct ggml_tensor * src0 = dst->src[0];
   const struct ggml_tensor * src1 = dst->src[1];
@@ -2464,7 +2474,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
     return;
   }
 
-  #pragma omp master
+  #pragma omp single
   {
     GGML_DISPATCH_QTYPES(TYPE, [&] {
       const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
@@ -2479,20 +2489,13 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
         src0->extra = aligned_alloc(64, N * row_size_B);
         convert_B_packed_format<type, blck_size>((void *)src0->extra, (const type *)src0->data, N, K);
       }
-    });
-  }
-  #pragma omp barrier
 
-  const float * A_data = static_cast<const float *>(src1->data);
-  parallel_for(nth, ith, M, [&](int begin, int end) {
-    GGML_DISPATCH_QTYPES(TYPE, [&] {
-      const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
-      for (int m = begin; m < end; ++m) {
+      const float * A_data = static_cast<const float *>(src1->data);
+      for (int m = 0; m < M; ++m) {
         from_float<vec_dot_type>(A_data + m * K, (char *)wdata + m * row_size_A, K);
       }
     });
-  });
-  #pragma omp barrier
+  }
 
   GGML_ASSERT(src0->extra != nullptr);
   if (M == 1) {

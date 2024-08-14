@@ -440,11 +440,6 @@ static ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 // precomputed f32 table for f16 (256 KB) (ggml-impl.h)
 float ggml_table_f32_f16[1 << 16];
 
-#if GGML_USE_AMX
-// global flag for amx init
-static bool ggml_amx_initialized = false;
-#endif
-
 GGML_CALL const char * ggml_status_to_string(enum ggml_status status) {
     switch (status) {
         case GGML_STATUS_ALLOC_FAILED: return "GGML status: error (failed to allocate memory)";
@@ -3703,10 +3698,6 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
             GGML_PRINT_DEBUG("%s: g_state initialized in %f ms\n", __func__, (t_end - t_start)/1000.0f);
         }
-
-#if GGML_USE_AMX
-        ggml_amx_initialized = ggml_amx_init();
-#endif
 
         is_first_call = false;
     }
@@ -12835,7 +12826,7 @@ static void ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
 #if GGML_USE_AMX
-    if (ggml_compute_forward_mul_mat_use_amx(dst) && ggml_amx_initialized) {
+    if (ggml_compute_forward_mul_mat_use_amx(dst)) {
         ggml_mul_mat_amx(dst, nth, ith, params->wdata, params->wsize);
         return;
     }
