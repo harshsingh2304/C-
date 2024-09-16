@@ -32,62 +32,59 @@
 #include <stdlib.h>
 #include <string>
 #include <thread>
+#include <future>
 #include <vector>
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
-    // static RNG initialization (revisit if n_threads stops being constant)
-    static const size_t n_threads = std::thread::hardware_concurrency();
-    static std::vector<std::default_random_engine> generators = []() {
-        std::random_device rd;
-        std::vector<std::default_random_engine> vec;
-        vec.reserve(n_threads);
-        //for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(1234 + i); } // fixed seed
-        for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(rd()); }
-        return vec;
-    }();
+    size_t nels = ggml_nelements(tensor);
+    static std::vector<float> data(nels);
+    data.resize(nels);
 
-    size_t size = ggml_nelements(tensor);
-    std::vector<float> data(size);
+    {
+        // parallel initialization
+        static const size_t n_threads = std::thread::hardware_concurrency();
+        // static RNG initialization (revisit if n_threads stops being constant)
+        static std::vector<std::default_random_engine> generators = []() {
+            std::random_device rd;
+            std::vector<std::default_random_engine> vec;
+            vec.reserve(n_threads);
+            //for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(1234 + i); } // fixed seed
+            for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(rd()); }
+            return vec;
+        }();
 
-    auto init_thread = [&](size_t ith, size_t start, size_t end) {
-        std::uniform_real_distribution<float> distribution(min, max);
-        for (size_t i = start; i < end; i++) {
-            data[i] = distribution(generators[ith]);
+        auto init_thread = [&](size_t ith, size_t start, size_t end) {
+            std::uniform_real_distribution<float> distribution(min, max);
+            auto & gen = generators[ith];
+            for (size_t i = start; i < end; i++) {
+                data[i] = distribution(gen);
+            }
+        };
+
+        int64_t start_time = ggml_time_us();
+        std::vector<std::future<void>> tasks;
+        tasks.reserve(n_threads);
+        for (size_t i = 0; i < n_threads; i++) {
+            size_t start =     i*nels/n_threads;
+            size_t end   = (i+1)*nels/n_threads;
+            tasks.push_back(std::async(std::launch::async, init_thread, i, start, end));
         }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (size_t i = 0; i < n_threads; i++) {
-        size_t start =     i*size/n_threads;
-        size_t end   = (i+1)*size/n_threads;
-        threads.emplace_back(init_thread, i, start, end);
-    }
-    for (auto & t : threads) {
-        t.join();
-    }
-
-#if 0
-    const char * val_str = getenv("GGML_TEST_EPS");
-    float val = 1e-9f;
-    if (val_str != nullptr) {
-        val = std::stof(val_str);
-        printf("GGML_TEST_EPS=%e\n", val);
-    }
-
-    // test quantization with very small values that may result in nan scales due to division by zero
-    if (ggml_is_quantized(tensor->type)) {
-        for (int i = 0; i < 256; i++) {
-            data[i] = val;
+        for (auto & t : tasks) {
+            t.get();
         }
+        int64_t end_time = ggml_time_us();
+        //printf("\nrandomize: %.2f ms\n", (end_time - start_time) / 1000.0);
     }
-#endif
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
-        ggml_backend_tensor_set(tensor, data.data(), 0, size * sizeof(float));
+        auto set_start = ggml_time_us();
+        ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
+        auto set_end = ggml_time_us();
+        //printf("set: %.2f ms\n", (set_end - set_start) / 1000.0);
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
-        GGML_ASSERT(size % ggml_blck_size(tensor->type) == 0);
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, size));
+        GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
+        static std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        dataq.resize(ggml_row_size(tensor->type, nels));
         std::vector<float> imatrix(tensor->ne[0], 1.0f); // dummy importance matrix
         const float * im = imatrix.data();
         if (!ggml_quantize_requires_imatrix(tensor->type)) {
@@ -98,16 +95,43 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], im);
-        GGML_ASSERT(ggml_validate_row_data(tensor->type, dataq.data(), dataq.size()));
-        // TODO: other cases
-        //#pragma omp parallel for
-        //for (int i = 0; i < tensor->ne[1]; i++) {
-        //    ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
-        //        i * tensor->ne[0], 1, tensor->ne[0], im);
-        //}
+        {
+            // parallel quantization by block
+            size_t blck_size = ggml_blck_size(tensor->type);
+            size_t n_blocks = nels / blck_size;
 
+            auto quantize_thread = [&](size_t start, size_t end) {
+                ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
+                    start * blck_size, end - start, blck_size, im);
+            };
+
+            const size_t min_blocks_per_thread = 1;
+            const size_t n_threads = std::min<size_t>(std::thread::hardware_concurrency()/2,
+                                        std::max<size_t>(1, n_blocks / min_blocks_per_thread));
+            auto quant_start = ggml_time_us();
+            std::vector<std::future<void>> tasks;
+            tasks.reserve(n_threads);
+            for (size_t i = 0; i < n_threads; i++) {
+                size_t start =     i*n_blocks/n_threads;
+                size_t end   = (i+1)*n_blocks/n_threads;
+                tasks.push_back(std::async(std::launch::async, quantize_thread, start, end));
+            }
+            for (auto & t : tasks) {
+                t.get();
+            }
+            auto quant_end = ggml_time_us();
+            //printf("quantize(%zu th): %.2f ms\n", n_threads, (quant_end - quant_start) / 1000.0);
+        }
+
+        //auto val_start = ggml_time_us();
+        //GGML_ASSERT(ggml_validate_row_data(tensor->type, dataq.data(), dataq.size()));
+        //auto val_end = ggml_time_us();
+        //printf("\nvalidate: %.2f ms\n\n", (val_end - val_start) / 1000.0);
+
+        auto set_start = ggml_time_us();
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        auto set_end = ggml_time_us();
+        //printf("set: %.2f ms\n\n", (set_end - set_start) / 1000.0);
     } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16 || tensor->type == GGML_TYPE_I32) {
         // This is going to create some weird integers though.
         ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
@@ -370,13 +394,13 @@ struct test_case {
         return 1e-4;
     }
 
-    virtual float grad_eps(){
+    virtual float grad_eps() {
         return 1e-1f;
     }
 
     // If false, estimate gradient with 2 points, neglects 3rd order derivative and higher.
     // If true,  estimate gradient with 4 points, neglects 5th order derivative and higher.
-    virtual bool grad_precise(){
+    virtual bool grad_precise() {
         return false;
     }
 
@@ -407,6 +431,10 @@ struct test_case {
             }
         }
         return size;
+    }
+
+    virtual uint64_t op_flops() {
+        return 0;
     }
 
     ggml_cgraph * gf = nullptr;
@@ -651,12 +679,11 @@ struct test_case {
         }
 
         // align while also leaving some margin for variations in parameters
-        int align = 20;
+        int align = 8;
         int last = (len + align - 1) / align * align;
         if (last - len < 5) {
             last += align;
         }
-        last = std::max(last, 60);
         printf("%*s", last - len, "");
 
         // allocate
@@ -668,7 +695,10 @@ struct test_case {
         }
 
         // randomize tensors
+        int64_t init_start = ggml_time_us();
         initialize_tensors(ctx);
+        int64_t init_end = ggml_time_us();
+        //printf("init took %.2f ms\n", (init_end - init_start) / 1000.0);
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_nodes, false);
@@ -677,9 +707,25 @@ struct test_case {
         // warmup run
         ggml_backend_graph_compute(backend, gf);
 
+        // determine number of runs
+        int n_runs;
+        if (op_flops() > 0) {
+            // based on flops
+            const uint64_t GFLOP = 1000 * 1000 * 1000;
+            const uint64_t target_flops_cpu =  8ULL * GFLOP;
+            const uint64_t target_flops_gpu = 64ULL * GFLOP;
+            uint64_t target_flops = ggml_backend_is_cpu(backend) ? target_flops_cpu : target_flops_gpu;
+            n_runs = std::min((size_t) ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops()) + 1;
+        } else {
+            // based on memory size
+            const size_t GB = 1ULL << 30;
+            const size_t target_size_cpu =  8 * GB;
+            const size_t target_size_gpu = 32 * GB;
+            size_t target_size = ggml_backend_is_cpu(backend) ? target_size_cpu : target_size_gpu;
+            n_runs = std::min((size_t) ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+        }
+
         // duplicate the op
-        size_t target_size = ggml_backend_is_cpu(backend) ? 1ULL << 33 : 1ULL << 35; // 8 GB CPU, 32 GB GPU
-        int n_runs = std::min((size_t) ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
         }
@@ -712,11 +758,36 @@ struct test_case {
         int64_t end_time = ggml_time_us();
         double time_us = end_time - start_time;
 
-        printf("    %5d runs - %8.2f us/run - %8zu kB/run - \033[1;34m%7.2f GB/s\033[0m\n",
+        printf("    %5d runs - %8.2f us/run - ",
             n_runs,
-            time_us / n_runs,
-            op_size(out) / 1024,
-            mem / (time_us/1e6) / 1024.0 / 1024.0 / 1024.0);
+            time_us / n_runs);
+
+        if (op_flops() > 0) {
+            double flops_per_sec = (op_flops() * n_runs) / (time_us / 1e6);
+            auto format_flops = [](double flops) -> std::string {
+                char buf[256];
+                if (flops >= 1e12) {
+                    snprintf(buf, sizeof(buf), "%6.2f TFLOP", flops / 1e12);
+                } else if (flops >= 1e9) {
+                    snprintf(buf, sizeof(buf), "%6.2f GFLOP", flops / 1e9);
+                } else if (flops >= 1e6) {
+                    snprintf(buf, sizeof(buf), "%6.2f MFLOP", flops / 1e6);
+                } else {
+                    snprintf(buf, sizeof(buf), "%6.2f KFLOP", flops / 1e3);
+                }
+                return buf;
+            };
+            printf("%s/run - \033[1;34m%sS\033[0m",
+                format_flops(op_flops()).c_str(),
+                format_flops(flops_per_sec).c_str());
+
+        } else {
+            printf("%8zu kB/run - \033[1;34m%7.2f GB/s\033[0m",
+                op_size(out) / 1024,
+                mem / (time_us/1e6) / 1024.0 / 1024.0 / 1024.0);
+        }
+        printf(" (compute took %.2f ms)", time_us / 1000.0);
+        printf("\n");
 
         ggml_backend_buffer_free(buf);
 
@@ -1571,13 +1642,8 @@ struct test_mul_mat : public test_case {
         return 5e-4;
     }
 
-    size_t op_size(ggml_tensor * t) override {
-        size_t a = ggml_nbytes(t->src[0]) * n * nr[0] * nr[1];
-        size_t b = ggml_nbytes(t->src[1]) * m;
-        size_t c  = ggml_nbytes(t);
-        return a + b + c;
-
-        GGML_UNUSED(t);
+    uint64_t op_flops() override {
+        return 2 * m * n * k * bs[0] * nr[0] * bs[1] * nr[1];
     }
 
     test_mul_mat(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -1621,13 +1687,8 @@ struct test_mul_mat_id : public test_case {
         return 5e-4;
     }
 
-    size_t op_size(ggml_tensor * t) override {
-        size_t a = ggml_nbytes(t->src[2]) * n;
-        size_t b = ggml_nbytes(t->src[1]) * m;
-        size_t c  = ggml_nbytes(t);
-        return a + b + c;
-
-        GGML_UNUSED(t);
+    uint64_t op_flops() override {
+        return 2 * m * k * n * n_used;
     }
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -3054,46 +3115,45 @@ struct test_falcon : public test_llm {
 // ###########################################
 // ## Section 3: GGML Op Test Instantiation ##
 // ###########################################
+static const ggml_type all_types[] = {
+    GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
+    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
+    GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+    GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+};
 
+static const ggml_type base_types[] = {
+    GGML_TYPE_F32, GGML_TYPE_F16,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_K,
+    GGML_TYPE_IQ2_XXS
+};
 
-static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op_name) {
+static const ggml_type other_types[] = {
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
+    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
+    GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+    GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_BF16,
+};
+
+// Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
-
-    const ggml_type all_types[] = {
-        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
-        GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
-        GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-        GGML_TYPE_Q8_0,
-        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-        GGML_TYPE_Q6_K,
-        // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
-        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
-        GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
-        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    };
-
-    const ggml_type base_types[] = {
-        GGML_TYPE_F32, GGML_TYPE_F16,
-        GGML_TYPE_Q4_0,
-        GGML_TYPE_Q4_K,
-        GGML_TYPE_IQ2_XXS
-    };
-
-    const ggml_type other_types[] = {
-        GGML_TYPE_Q4_1,
-        GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-        GGML_TYPE_Q8_0,
-        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-        GGML_TYPE_Q5_K,
-        GGML_TYPE_Q6_K,
-        // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
-        GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
-        GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
-        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-        GGML_TYPE_BF16,
-    };
 
     // unary ops
     for (int v : {0, 1}) {
@@ -3257,6 +3317,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1024, 32, 4));
 
+
 #if 1
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -3277,6 +3338,14 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, 256, {10, 10}, {2, 2}));
         }
     }
+    for (ggml_type type_a : other_types) {
+        for (ggml_type type_b : {GGML_TYPE_F32}) {
+            if (ggml_blck_size(type_a) != 256) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, ggml_blck_size(type_a), {1,  1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
+        }
+    }
 #else
     // m = a rows
     // n = b rows
@@ -3295,15 +3364,6 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         }
     }
 #endif
-
-    for (ggml_type type_a : other_types) {
-        for (ggml_type type_b : {GGML_TYPE_F32}) {
-            if (ggml_blck_size(type_a) != 256) {
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, ggml_blck_size(type_a), {1,  1}, {1, 1}));
-            }
-            test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
-        }
-    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
@@ -3485,20 +3545,28 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_falcon(2));
 #endif
 
-    // run tests
-    if (mode == MODE_GRAD) {
-        size_t n_ok = 0;
-        for (auto & test : test_cases) {
-            if (test->eval_grad(backend, op_name)) {
-                n_ok++;
+    return test_cases;
+}
+
+// Test cases for performance evaluation: should be representative of real-world use cases
+static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+    std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int bs : {1, 8, 16, 32, 512}) {
+        for (ggml_type type_a : all_types) {
+            for (ggml_type type_b : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 4096, {1,  1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 32000, bs, 4096, {1,  1}, {1, 1}));
             }
         }
-        printf("  %zu/%zu tests passed\n", n_ok, test_cases.size());
-
-        return n_ok == test_cases.size();
     }
 
+    return test_cases;
+}
+
+static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op_name) {
     if (mode == MODE_TEST) {
+        auto test_cases = make_test_cases_eval();
         ggml_backend_t backend_cpu = ggml_backend_cpu_init();
 
         size_t n_ok = 0;
@@ -3514,7 +3582,21 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         return n_ok == test_cases.size();
     }
 
+    if (mode == MODE_GRAD) {
+        auto test_cases = make_test_cases_eval();
+        size_t n_ok = 0;
+        for (auto & test : test_cases) {
+            if (test->eval_grad(backend, op_name)) {
+                n_ok++;
+            }
+        }
+        printf("  %zu/%zu tests passed\n", n_ok, test_cases.size());
+
+        return n_ok == test_cases.size();
+    }
+
     if (mode == MODE_PERF) {
+        auto test_cases = make_test_cases_perf();
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_name);
         }
@@ -3528,9 +3610,9 @@ static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o op] [-b backend]\n", argv[0]);
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
-    printf("      - perf (performance evaluation)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
-    printf("    op names are as given by ggml_op_desc() (e.g. GGML_ADD)\n");
+    printf("      - perf (performance evaluation)\n");
+    printf("    op names for -o are as given by ggml_op_desc() (e.g. ADD, MUL_MAT, etc)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -3587,6 +3669,11 @@ int main(int argc, char ** argv) {
             ggml_backend_free(backend);
             n_ok++;
             continue;
+        }
+
+        if (ggml_backend_is_cpu(backend)) {
+            // TODO: better value for n_threads
+            ggml_backend_cpu_set_n_threads(backend, std::thread::hardware_concurrency() / 2);
         }
 
         printf("  Backend name: %s\n", ggml_backend_name(backend));

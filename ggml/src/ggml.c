@@ -3168,15 +3168,31 @@ struct ggml_state {
 
 // global state
 static struct ggml_state g_state;
-static atomic_flag g_state_critical = ATOMIC_FLAG_INIT;
 
+#if !defined(_MSC_VER)
+// critical section via pthread mutex
+static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void ggml_critical_section_start(void) {
+    pthread_mutex_lock(&g_state_mutex);
+}
+
+static void ggml_critical_section_end(void) {
+    pthread_mutex_unlock(&g_state_mutex);
+}
+#else
 // critical section via spin lock
-inline static void ggml_critical_section_start(void) {
+static atomic_flag g_state_critical = ATOMIC_FLAG_INIT;
+static void ggml_critical_section_start(void) {
     while (atomic_flag_test_and_set(&g_state_critical)) {
         // spin
         sched_yield();
     }
 }
+
+static void ggml_critical_section_end(void) {
+    atomic_flag_clear(&g_state_critical);
+}
+#endif
 
 #ifdef GGML_USE_OPENMP
 static void ggml_barrier(struct ggml_threadpool * threadpool) {
@@ -3213,12 +3229,6 @@ static void ggml_barrier(struct ggml_threadpool * threadpool) {
     }
 }
 #endif
-
-// TODO: make this somehow automatically executed
-//       some sort of "sentry" mechanism
-inline static void ggml_critical_section_end(void) {
-    atomic_flag_clear(&g_state_critical);
-}
 
 #if defined(__gnu_linux__)
 static cpu_set_t ggml_get_numa_affinity(void) {
