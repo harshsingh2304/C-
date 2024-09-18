@@ -582,7 +582,7 @@ endif
 
 ifndef GGML_NO_AMX
 	MK_CPPFLAGS += -DGGML_USE_AMX
-	OBJ_GGML    += ggml/src/ggml-amx/mmq.o
+	OBJ_GGML    += ggml/src/ggml-amx.o ggml/src/ggml-amx/mmq.o
 endif
 
 ifdef GGML_RPC
@@ -1088,6 +1088,11 @@ ggml/src/llamafile/sgemm.o: \
 endif # GGML_NO_LLAMAFILE
 
 ifndef GGML_NO_AMX
+ggml/src/ggml-amx.o: \
+	ggml/src/ggml-amx.cpp \
+	ggml/include/ggml-amx.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 ggml/src/ggml-amx/mmq.o: \
 	ggml/src/ggml-amx/mmq.cpp \
 	ggml/src/ggml-amx/mmq.h \

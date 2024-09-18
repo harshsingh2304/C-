@@ -32,6 +32,15 @@
 #  include "ggml-metal.h"
 #endif
 
+// enable AMX only with OPENMP
+#if !defined(__AMX_INT8__) || !defined(GGML_USE_OPENMP)
+#  undef GGML_USE_AMX
+#endif
+
+#ifdef GGML_USE_AMX
+#  include "ggml-amx.h"
+#endif
+
 // TODO: replace with ggml API call
 #define QK_K 256
 
@@ -3288,6 +3297,9 @@ struct llama_context {
     std::vector<ggml_backend_t> backends;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
+#endif
+#ifdef GGML_USE_AMX
+    ggml_backend_t backend_amx = nullptr;
 #endif
 #ifdef GGML_USE_BLAS
     ggml_backend_t backend_blas = nullptr;
@@ -16632,6 +16644,13 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_threadpool(lctx.backend_cpu, threadpool);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
     }
+
+#ifdef GGML_USE_AMX
+    if (lctx.backend_amx != nullptr) {
+        ggml_backend_amx_set_n_threads(lctx.backend_amx, n_threads);
+    }
+#endif
+
 #ifdef GGML_USE_BLAS
     if (lctx.backend_blas != nullptr) {
         ggml_backend_blas_set_n_threads(lctx.backend_blas, n_threads);
@@ -18962,6 +18981,19 @@ struct llama_context * llama_new_context_with_model(
             }
             ctx->backends.push_back(backend);
         }
+    }
+#endif
+
+#if defined(GGML_USE_AMX)
+    {
+        printf("### ggml_use_amx from llama.cpp\n");
+        ctx->backend_amx = ggml_backend_amx_init();
+        if (ctx->backend_amx == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to initialize AMX backend\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        ctx->backends.push_back(ctx->backend_amx);
     }
 #endif
 

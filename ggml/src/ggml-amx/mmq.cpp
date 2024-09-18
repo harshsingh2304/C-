@@ -37,59 +37,6 @@
 
 namespace {
 
-#define TILE_M 16
-#define TILE_N 16
-#define TILE_K 32
-#define VNNI_BLK 4
-
-#define AMX_BLK_SIZE 32
-
-#define TMM0 0
-#define TMM1 1
-#define TMM2 2
-#define TMM3 3
-#define TMM4 4
-#define TMM5 5
-#define TMM6 6
-#define TMM7 7
-
-// parallel routines
-template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
-inline T div_up(T x, T y) { return (x + y - 1) / y; }
-
-template <typename T>
-void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
-#if 0
-  // onednn partition pattern
-  T& n_my = n_end;
-  if (nth <= 1 || n == 0) {
-    n_start = 0;
-    n_my = n;
-  } else {
-    T n1 = div_up(n, nth);
-    T n2 = n1 - 1;
-    T T1 = n - n2 * nth;
-    n_my = ith < T1 ? n1 : n2;
-    n_start = ith <= T1 ? ith*n1 : T1 * n1 + (ith - T1) * n2;
-  }
-  n_end += n_start;
-#else
-  // pytorch aten partition pattern
-  T n_my = div_up(n, nth);
-  n_start = ith * n_my;
-  n_end = std::min(n_start + n_my, n);
-#endif
-}
-
-template <typename func_t>
-inline void parallel_for(int nth, int ith, int n, const func_t& f) {
-  // int nth = omp_get_num_threads();
-  // int ith = omp_get_thread_num();
-  int tbegin, tend;
-  balance211(n, nth, ith, tbegin, tend);
-  f(tbegin, tend);
-}
-
 // Forced unrolling
 template <int n>
 struct Unroll {
@@ -1426,13 +1373,13 @@ struct tinygemm_kernel_avx<float, ggml_fp16_t, float, BLOCK_M, BLOCK_N, BLOCK_K>
 #define PACKED_INDEX(n, k, KB, tile_size) (n * KB + k) * tile_size
 
 template<typename TB, int BLOCK_K>
-void convert_B_packed_format(void * RESTRICT packed_B, const TB * RESTRICT B, int N, int K) {
+void convert_B_packed_format(void * RESTRICT packed_B, const TB * RESTRICT B, int N, int K, int n_threads) {
   const int NB = N / TILE_N;
   const int KB = K / BLOCK_K;
   const int TILE_SIZE = get_tile_size<TB>();
 
   // parallel on NB should be enough
-  parallel_for(1, 0, NB, [&](int begin, int end) {
+  parallel_for(n_threads, NB, [&](int begin, int end) {
     for (int n = begin; n < end; ++n) {
       for (int k = 0; k < KB; ++k) {
         int n0 = n * TILE_N;
@@ -2345,74 +2292,6 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
 
 } // anonymous namespace
 
-#define ARCH_GET_XCOMP_PERM     0x1022
-#define ARCH_REQ_XCOMP_PERM     0x1023
-#define XFEATURE_XTILECFG       17
-#define XFEATURE_XTILEDATA      18
-
-bool ggml_amx_init() {
-#if defined(__gnu_linux__)
-  if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
-    fprintf(stderr, "AMX is not ready to be used!\n");
-    return false;
-  }
-  return true;
-#elif defined(_WIN32)
-  return true;
-#endif
-}
-
-bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
-
-  static thread_local bool is_first_time = true;
-  if (is_first_time) {
-    #pragma omp single
-    {
-      ggml_amx_init();
-    }
-
-    // load tile config
-    ggml_tile_config_init();
-  }
-  is_first_time = false;
-
-  const struct ggml_tensor * src0 = dst->src[0];
-  const struct ggml_tensor * src1 = dst->src[1];
-
-  const enum ggml_type type = src0->type;
-  const int64_t ne0 = dst->ne[0];
-
-  bool is_training = src0->grad || src1->grad;
-
-  // amx kernels enables for Q4_0, Q4_1, Q8_0, F16
-  // Q4_K, Q5_K, Q6_K, IQ4_XS enabled for QK_K = 256
-  bool has_amx_kernels = (type == GGML_TYPE_Q4_0) ||
-      (type == GGML_TYPE_Q4_1) ||
-      (type == GGML_TYPE_Q8_0) ||
-#ifndef GGML_QKK_64
-      // only enabled for QK_K == 256
-      (type == GGML_TYPE_Q4_K) ||
-      (type == GGML_TYPE_Q5_K) ||
-      (type == GGML_TYPE_Q6_K) ||
-      (type == GGML_TYPE_IQ4_XS) ||
-#endif
-      (type == GGML_TYPE_F16);
-
-  // handle only 2d gemm for now
-  auto is_contiguous_2d = [](const struct ggml_tensor * t) {
-    return ggml_is_contiguous(t) && t->ne[3] == 1 && t->ne[2] == 1;
-  };
-
-  return dst->op != GGML_OP_MUL_MAT_ID &&
-      is_contiguous_2d(src0) &&
-      is_contiguous_2d(src1) &&
-      !is_training &&
-      src1->type == GGML_TYPE_F32 &&
-      has_amx_kernels &&
-      // out features is 32x
-      ne0 % (TILE_N * 2) == 0;
-}
-
 // NB: mixed dtype gemm with Advanced Matrix Extensions (Intel AMX)
 //
 // src0: weight in shape of {N, K}, quantized
@@ -2421,11 +2300,13 @@ bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
 //
 // the function performs: dst = src1 @ src0.T
 //
-void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, int wsize) {
+void ggml_backend_amx_mul_mat(ggml_backend_amx_context * ctx, struct ggml_tensor * dst) {
   struct ggml_tensor * src0 = dst->src[0];
   struct ggml_tensor * src1 = dst->src[1];
 
   const enum ggml_type TYPE = src0->type;
+
+  const int n_threads = ctx->n_threads;
 
   // f16 only has avx512 kernels for now,
   // amx kernels will be added once 6th gen xeon is released.
@@ -2442,7 +2323,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
     const int MB = div_up(M, BLOCK_M);
     const int NB = div_up(N, BLOCK_N);
 
-    parallel_for(nth, ith, MB * NB, [&](int begin, int end) {
+    parallel_for(n_threads, MB * NB, [&](int begin, int end) {
       GGML_DISPATCH_FLOATING_TYPES(TYPE, [&] {
         for (int i = begin; i < end; ++i) {
           int mb = i / NB;
@@ -2474,28 +2355,35 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
     return;
   }
 
-  #pragma omp single
-  {
-    GGML_DISPATCH_QTYPES(TYPE, [&] {
-      const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
-      GGML_ASSERT(wsize >= int(M * row_size_A));
+  // pointer to work space, used convert A from float to quantized type
+  void * wdata = nullptr;
 
-      // Q4_0, Q4_1, Q8_0 handles 1 TILE_K per blck_size
-      // Q4_K, Q5_K, Q6_K, IQ4_XS handles 8 TILE_K per blck_size
-      GGML_ASSERT(TILE_K == blck_size || TILE_K * 8 == blck_size);
-      // pack mat B to vnni format
-      if (src0->extra == nullptr) {
-        const size_t row_size_B = get_row_size<type, blck_size>(K);
-        src0->extra = aligned_alloc(64, N * row_size_B);
-        convert_B_packed_format<type, blck_size>((void *)src0->extra, (const type *)src0->data, N, K);
-      }
+  //TODO: performance improvement: merge quant A
+  GGML_DISPATCH_QTYPES(TYPE, [&] {
+    const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
+    const size_t desired_wsize = M * row_size_A;
+    if (ctx->work_size < desired_wsize) {
+        ctx->work_data.reset(new char[desired_wsize]);
+        ctx->work_size = desired_wsize;
+    }
+    wdata = ctx->work_data.get();
 
-      const float * A_data = static_cast<const float *>(src1->data);
-      for (int m = 0; m < M; ++m) {
-        from_float<vec_dot_type>(A_data + m * K, (char *)wdata + m * row_size_A, K);
-      }
-    });
-  }
+    // Q4_0, Q4_1, Q8_0 handles 1 TILE_K per blck_size
+    // Q4_K, Q5_K, Q6_K, IQ4_XS handles 8 TILE_K per blck_size
+    GGML_ASSERT(TILE_K == blck_size || TILE_K * 8 == blck_size);
+    // pack mat B to vnni format
+    if (src0->extra == nullptr) {
+      const size_t row_size_B = get_row_size<type, blck_size>(K);
+      src0->extra = aligned_alloc(64, N * row_size_B);
+      convert_B_packed_format<type, blck_size>((void *)src0->extra, (const type *)src0->data, N, K, n_threads);
+    }
+
+    const float * A_data = static_cast<const float *>(src1->data);
+    for (int m = 0; m < M; ++m) {
+      from_float<vec_dot_type>(A_data + m * K, (char *)wdata + m * row_size_A, K);
+    }
+  });
+
 
   GGML_ASSERT(src0->extra != nullptr);
   if (M == 1) {
@@ -2504,7 +2392,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
     constexpr int BLOCK_N = TILE_N * kTilesN;
     const int NB = div_up(N, BLOCK_N);
 
-    parallel_for(nth, ith, NB, [&](int begin, int end) {
+    parallel_for(n_threads, NB, [&](int begin, int end) {
       GGML_DISPATCH_QTYPES(TYPE, [&] {
         const int KB = K / blck_size;
         const int TILE_SIZE = get_tile_size<type>();
@@ -2534,7 +2422,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
   const int MB = div_up(M, BLOCK_M);
   const int NB = div_up(N, BLOCK_N);
 
-  parallel_for(nth, ith, MB * NB, [&](int begin, int end) {
+  parallel_for(n_threads, MB * NB, [&](int begin, int end) {
     GGML_DISPATCH_QTYPES(TYPE, [&] {
       const int KB = K / blck_size;
       const int TILE_SIZE = get_tile_size<type>();
@@ -2561,18 +2449,7 @@ void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, 
 
 #else // if defined(__AMX_INT8__)
 
-bool ggml_amx_init() {
-  fprintf(stderr, "GGML is not compiled with AMX support!\n");
-  return false;
-}
-
-bool ggml_compute_forward_mul_mat_use_amx(struct ggml_tensor * dst) {
-  GGML_UNUSED(dst);
-  fprintf(stderr, "GGML is not compiled with AMX support!\n");
-  return false;
-}
-
-void ggml_mul_mat_amx(struct ggml_tensor * dst, int nth, int ith, void * wdata, int wsize) {
+void ggml_backend_amx_mul_mat(ggml_backend_amx_context * ctx, struct ggml_tensor * dst) {
   GGML_UNUSED(dst);
   GGML_UNUSED(nth);
   GGML_UNUSED(ith);
