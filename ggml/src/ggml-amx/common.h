@@ -69,6 +69,8 @@ inline void parallel_for(int nth, int n, const func_t& f) {
   }
 #else
   f(0, n);
+
+  GGML_UNUSED(nth);
 #endif
 }
 
