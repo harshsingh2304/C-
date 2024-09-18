@@ -2450,11 +2450,8 @@ void ggml_backend_amx_mul_mat(ggml_backend_amx_context * ctx, struct ggml_tensor
 #else // if defined(__AMX_INT8__)
 
 void ggml_backend_amx_mul_mat(ggml_backend_amx_context * ctx, struct ggml_tensor * dst) {
+  GGML_UNUSED(ctx);
   GGML_UNUSED(dst);
-  GGML_UNUSED(nth);
-  GGML_UNUSED(ith);
-  GGML_UNUSED(wdata);
-  GGML_UNUSED(wsize);
   fprintf(stderr, "GGML is not compiled with AMX support!\n");
 }
 
