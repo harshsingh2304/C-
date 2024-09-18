@@ -269,8 +269,12 @@ if (GGML_AMX)
     message(STATUS "Using AMX")
 
     add_compile_definitions(GGML_USE_AMX)
-    set(GGML_HEADERS_AMX ggml-amx/mmq.h)
-    set(GGML_SOURCES_AMX ggml-amx/mmq.cpp)
+
+    file(GLOB   GGML_HEADERS_AMX "ggml-amx/*.h")
+    list(APPEND GGML_HEADERS_AMX "../include/ggml-amx.h")
+
+    file(GLOB   GGML_SOURCES_AMX "ggml-amx/*.cpp")
+    list(APPEND GGML_SOURCES_AMX "ggml-amx.cpp")
 endif()
 
 if (GGML_CUDA)
