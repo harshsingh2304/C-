@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-cpu-impl.h" // <immintrin.h>
 
 #include <algorithm>
 #include <memory>
