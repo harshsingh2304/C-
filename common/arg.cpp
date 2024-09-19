@@ -1103,7 +1103,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             else if (value == "rank") { params.pooling_type = LLAMA_POOLING_TYPE_RANK; }
             else { throw std::invalid_argument("invalid value"); }
         }
-    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"--attention"}, "{causal,non,causal}",
         "attention type for embeddings, use model default if unspecified",
