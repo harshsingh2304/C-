@@ -4102,15 +4102,42 @@ class GraniteModel(LlamaModel):
         #   consistency
         if attention_scale := self.hparams.get("attention_multiplier"):
             self.gguf_writer.add_attention_scale(attention_scale)
+            logger.info("gguf: (granite) attention_scale = %s", attention_scale)
         if embedding_scale := self.hparams.get("embedding_multiplier"):
             self.gguf_writer.add_embedding_scale(embedding_scale)
+            logger.info("gguf: (granite) embedding_scale = %s", embedding_scale)
         if residual_scale := self.hparams.get("residual_multiplier"):
             self.gguf_writer.add_residual_scale(residual_scale)
-        if logits_scaling := self.hparams.get("logits_scaling"):
-            self.gguf_writer.add_logit_scale(logits_scaling)
+            logger.info("gguf: (granite) residual_scale = %s", residual_scale)
+        if logits_scale := self.hparams.get("logits_scaling"):
+            self.gguf_writer.add_logit_scale(logits_scale)
+            logger.info("gguf: (granite) logits_scale = %s", logits_scale)
+
+
+@Model.register("GraniteMoeForCausalLM")
+class GraniteMoeModel(GraniteModel):
+    """Conversion for IBM's GraniteMoeForCausalLM"""
+    model_arch = gguf.MODEL_ARCH.GRANITE_MOE
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        """In modeling_granitemoe, the JetMoe implementation of parallel experts
+        is used. This essentially merges w1 and w3 into a single tensor with 2x
+        the hidden size that is then split during forward. To keep compativility
+        with existing mixtral support, we pull them apart here.
+        """
+
+        if name.endswith("block_sparse_moe.input_linear.weight"):
+            gate, up = data_torch.chunk(2, dim=-2)
+            return [
+                (self.map_tensor_name(f"model.layers.{bid}.block_sparse_moe.input_linear.gate.weight"), gate),
+                (self.map_tensor_name(f"model.layers.{bid}.block_sparse_moe.input_linear.up.weight"), up),
+            ]
+
+        return super().modify_tensors(data_torch, name, bid)
 
 
 ###### CONVERSION LOGIC ######
+
 
 # tree of lazy tensors
 class LazyTorchTensor(gguf.LazyBase):
