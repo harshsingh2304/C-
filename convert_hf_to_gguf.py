@@ -291,8 +291,13 @@ class Model:
                     bid = int(part)
                     break
 
-            for new_name, data in ((n, d.squeeze().numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
-                data: np.ndarray  # type hint
+            for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
+                data = data_torch.squeeze().numpy()
+
+                # if data ends up empty, it means data_torch was a scalar tensor -> restore
+                if len(data.shape) == 0:
+                    data = data_torch.numpy()
+
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
@@ -2598,7 +2603,7 @@ class NomicBertModel(BertModel):
         self.gguf_writer.add_rope_freq_base(self.hparams["rotary_emb_base"])
 
 
-@Model.register("XLMRobertaModel")
+@Model.register("XLMRobertaModel", "XLMRobertaForSequenceClassification")
 class XLMRobertaModel(BertModel):
     model_arch = gguf.MODEL_ARCH.BERT
 
@@ -2696,6 +2701,11 @@ class XLMRobertaModel(BertModel):
         self.gguf_writer.add_add_eos_token(True)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # if name starts with "roberta.", remove the prefix
+        # e.g. https://huggingface.co/BAAI/bge-reranker-v2-m3/tree/main
+        if name.startswith("roberta."):
+            name = name[8:]
+
         # position embeddings start at pad_token_id + 1, so just chop down the weight tensor
         if name == "embeddings.position_embeddings.weight":
             if self._position_offset is not None:

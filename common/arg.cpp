@@ -391,7 +391,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params) {
             params.verbose_prompt = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    ));
     add_opt(llama_arg(
         {"--no-display-prompt"},
         format("don't print prompt at generation (default: %s)", !params.display_prompt ? "true" : "false"),
@@ -1098,11 +1098,12 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params, const std::string & value) {
             /**/ if (value == "none") { params.pooling_type = LLAMA_POOLING_TYPE_NONE; }
             else if (value == "mean") { params.pooling_type = LLAMA_POOLING_TYPE_MEAN; }
-            else if (value == "cls") { params.pooling_type = LLAMA_POOLING_TYPE_CLS; }
+            else if (value == "cls")  { params.pooling_type = LLAMA_POOLING_TYPE_CLS;  }
             else if (value == "last") { params.pooling_type = LLAMA_POOLING_TYPE_LAST; }
+            else if (value == "rank") { params.pooling_type = LLAMA_POOLING_TYPE_RANK; }
             else { throw std::invalid_argument("invalid value"); }
         }
-    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"--attention"}, "{causal,non,causal}",
         "attention type for embeddings, use model default if unspecified",
