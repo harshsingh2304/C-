@@ -76,7 +76,11 @@ int ggml_sve_cnt_b = 0;
 #if __has_feature(thread_sanitizer)
 #define GGML_TSAN_ENABLED 1
 #endif
+#else  // __has_feature
+#if defined(__SANITIZE_THREAD__)
+#define GGML_TSAN_ENABLED 1
 #endif
+#endif // __has_feature
 
 #if defined(_WIN32)
 
@@ -3216,20 +3220,24 @@ static void ggml_barrier(struct ggml_threadpool * tp) {
     if (n_barrier == (n_threads - 1)) {
         // last thread
         atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
-    } else {
-        // wait for other threads
-        while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
-            ggml_thread_cpu_relax();
-        }
 
-        #ifdef GGML_TSAN_ENABLED
-        // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
-        atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
-        #else
-        atomic_thread_fence(memory_order_seq_cst);
-        #endif
+        // exit barrier (fill seq-cst fence)
+        atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
+        return;
     }
+
+    // wait for other threads
+    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+        ggml_thread_cpu_relax();
+    }
+
+    // exit barrier (full seq-cst fence)
+    // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
+    #ifdef GGML_TSAN_ENABLED
+    atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
+    #else
+    atomic_thread_fence(memory_order_seq_cst);
+    #endif
 #endif
 }
 
@@ -20260,8 +20268,8 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
 
 // sync thread state after polling
 static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
-    #ifdef GGML_TSAN_ENABLED
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
+    #ifdef GGML_TSAN_ENABLED
     atomic_fetch_add_explicit(&state->threadpool->n_graph, 0, memory_order_seq_cst);
     #else
     atomic_thread_fence(memory_order_seq_cst);
