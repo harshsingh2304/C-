@@ -265,6 +265,18 @@ if (GGML_LLAMAFILE)
     set(GGML_SOURCES_LLAMAFILE llamafile/sgemm.cpp)
 endif()
 
+if (GGML_AMX)
+    message(STATUS "Using AMX")
+
+    add_compile_definitions(GGML_USE_AMX)
+
+    file(GLOB   GGML_HEADERS_AMX "ggml-amx/*.h")
+    list(APPEND GGML_HEADERS_AMX "../include/ggml-amx.h")
+
+    file(GLOB   GGML_SOURCES_AMX "ggml-amx/*.cpp")
+    list(APPEND GGML_SOURCES_AMX "ggml-amx.cpp")
+endif()
+
 if (GGML_CUDA)
     cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
@@ -1163,6 +1175,18 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
                 add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVX512BF16__>)
                 add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVX512BF16__>)
             endif()
+            if (GGML_AMX_TILE)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AMX_TILE__>)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AMX_TILE__>)
+            endif()
+            if (GGML_AMX_INT8)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AMX_INT8__>)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AMX_INT8__>)
+            endif()
+            if (GGML_AMX_BF16)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AMX_BF16__>)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AMX_BF16__>)
+            endif()
         elseif (GGML_AVX2)
             list(APPEND ARCH_FLAGS /arch:AVX2)
         elseif (GGML_AVX)
@@ -1196,6 +1220,15 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         endif()
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
+        endif()
+        if (GGML_AMX_TILE)
+            list(APPEND ARCH_FLAGS -mamx-tile)
+        endif()
+        if (GGML_AMX_INT8)
+            list(APPEND ARCH_FLAGS -mamx-int8)
+        endif()
+        if (GGML_AMX_BF16)
+            list(APPEND ARCH_FLAGS -mamx-bf16)
         endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
@@ -1322,6 +1355,7 @@ add_library(ggml
             ${GGML_SOURCES_ROCM}      ${GGML_HEADERS_ROCM}
             ${GGML_SOURCES_BLAS}      ${GGML_HEADERS_BLAS}
             ${GGML_SOURCES_LLAMAFILE} ${GGML_HEADERS_LLAMAFILE}
+            ${GGML_SOURCES_AMX}       ${GGML_HEADERS_AMX}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
             )

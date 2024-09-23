@@ -46,9 +46,18 @@ int ggml_sve_cnt_b = 0;
 #undef GGML_USE_LLAMAFILE
 #endif
 
+// enable AMX only with OPENMP
+//#if !defined(__AMX_INT8__) || !defined(GGML_USE_OPENMP)
+//#undef GGML_USE_AMX
+//#endif
+
 #ifdef GGML_USE_LLAMAFILE
 #include <llamafile/sgemm.h>
 #endif
+
+//#ifdef GGML_USE_AMX
+//#include <ggml-amx/mmq.h>
+//#endif
 
 #if defined(_MSC_VER)
 // disable "possible loss of data" to avoid hundreds of casts
@@ -12865,6 +12874,13 @@ static void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+//#if GGML_USE_AMX
+//    if (ggml_compute_forward_mul_mat_use_amx(dst)) {
+//        ggml_mul_mat_amx(dst, nth, ith, params->wdata, params->wsize);
+//        return;
+//    }
+//#endif
+
 #if GGML_USE_LLAMAFILE
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -23530,6 +23546,14 @@ int ggml_cpu_has_avx512_vnni(void) {
 
 int ggml_cpu_has_avx512_bf16(void) {
 #if defined(__AVX512BF16__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_amx_int8(void) {
+#if defined(__AMX_INT8__)
     return 1;
 #else
     return 0;
