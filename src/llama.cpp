@@ -6400,6 +6400,8 @@ static void llm_load_vocab(
     }
     GGML_ASSERT(vocab.id_to_token.size() == vocab.token_to_id.size());
 
+    vocab.init_tokenizer();
+
     // determine the newline token: LLaMA "<0x0A>" == 10 == '\n', Falcon 193 == '\n'
     if (vocab.type == LLAMA_VOCAB_TYPE_SPM) {
         // For Fill-In-the-Middle (FIM)/infill models which where converted
@@ -6449,11 +6451,11 @@ static void llm_load_vocab(
     } else if (vocab.type == LLAMA_VOCAB_TYPE_WPM) {
         vocab.linefeed_id = vocab.special_pad_id;
     } else if (vocab.type == LLAMA_VOCAB_TYPE_RWKV) {
-        const std::vector<int> ids = llama_tokenize_internal(vocab, "\n", false);
+        const std::vector<int> ids = llama_tokenize_internal(model.vocab, "\n", false);
         GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
         vocab.linefeed_id = ids[0];
     } else {
-        const std::vector<int> ids = llama_tokenize_internal(vocab, "\xC4\x8A", false); // U+010A
+        const std::vector<int> ids = llama_tokenize_internal(model.vocab, "\xC4\x8A", false); // U+010A
         GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
         vocab.linefeed_id = ids[0];
     }
